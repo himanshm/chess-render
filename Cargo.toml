@@ -1,0 +1,15 @@
+[package]
+name = "chess-render"
+version = "0.1.0"
+edition = "2021"
+description = "A configurable, embeddable chess GUI with UCI support and move validation."
+license = "MIT"
+
+[dependencies]
+macroquad = "0.4"
+chess = "3.2"
+
+[features]
+default = []
+# Enable this feature to include UCI engine integration logic
+uci = []
