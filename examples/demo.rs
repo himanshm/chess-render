@@ -4,7 +4,7 @@ use macroquad::prelude::*;
 #[macroquad::main("Chess Render")]
 async fn main() {
     // Use default config, but you can set the engine path here
-    let mut config = ChessConfig::default();
+    let config = ChessConfig::default();
 
     // If you have a UCI engine, uncomment and set the path
     // #[cfg(feature = "uci")]
