@@ -9,6 +9,7 @@
 //! - Optional UCI engine integration (behind the `uci` feature flag) – now with proper asynchronous
 //!   communication via a background thread.
 //! - Endgame detection (checkmate, stalemate) and a restart button.
+//! - Automatic centering of the board in the window (configurable).
 //!
 //! ## Quick Start
 //!
@@ -21,7 +22,7 @@
 //!
 //! #[macroquad::main("Chess")]
 //! async fn main() {
-//!     let config = ChessConfig::default();
+//!     let config = ChessConfig::default(); // board is centered automatically
 //!     let mut gui = ChessGui::new(config);
 //!     gui.load_pieces().await;
 //!
@@ -55,15 +56,16 @@
 //!
 //! ## Coordinate System
 //!
-//! The board is drawn as an 8×8 grid where each square is 64×64 pixels.
-//! The board is always aligned to the top‑left corner of the window (0,0) and is 512×512 pixels.
-//! The perspective can be flipped so that the current player’s side is at the bottom.
+//! The board is drawn as an 8×8 grid where each square has the size given by `square_size`
+//! (default 64). The board is placed either centered in the window (default) or at a fixed
+//! offset if `center_board` is set to `false`. The perspective can be flipped so that the
+//! current player’s side is at the bottom.
 //!
 //! ## Game Flow
 //!
 //! 1. The game starts with a standard starting position.
 //! 2. Players take turns by clicking and dragging pieces.
-//! 3. Legal moves are enforced; pawn promotion is automatically done to a Queen.
+//! 3. Legal moves are enforced; pawn promotion uses the configured `promotion_piece`.
 //! 4. After each move, the board flips to show the opponent’s perspective if `auto_flip_perspective` is `true`.
 //! 5. When checkmate or stalemate occurs, an overlay message is shown and the user can press `R` to restart.
 //! 6. If the `uci` feature is enabled and an engine path is set, the engine moves as configured
@@ -72,7 +74,8 @@
 use std::str::FromStr;
 
 use chess::{
-    Board, ChessMove, Color as ChessColor, File, MoveGen, Piece as ChessPiece, Rank, Square,
+    Board, BoardStatus, ChessMove, Color as ChessColor, File, MoveGen, Piece as ChessPiece, Rank,
+    Square,
 };
 use macroquad::prelude::*;
 
@@ -80,28 +83,17 @@ use macroquad::prelude::*;
 // This assumes the file is located at `src/assets/pieces.png`.
 const DEFAULT_PIECES_PNG: &[u8] = include_bytes!("assets/pieces.png");
 
-/// Custom game result enum since the `chess` crate doesn't provide one directly.
-///
-/// This represents the outcome of a finished game:
-/// - `WhiteWins` – White checkmated Black.
-/// - `BlackWins` – Black checkmated White.
-/// - `Draw` – Stalemate (or, in future, other draw conditions).
+/// Custom game result enum that covers all end‑game states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameResult {
-    /// White has won by checkmate.
     WhiteWins,
-    /// Black has won by checkmate.
     BlackWins,
-    /// The game ended in a draw (currently only stalemate is detected).
     Draw,
 }
 
 /// Helper to convert 0-7 file/rank indices to `chess::Square`.
-///
-/// # Panics
-/// This function uses `unreachable!()` if the input is outside 0..7.
-/// It is only called with valid indices from board iteration, so it is safe.
-pub(crate) fn get_square(file: u32, rank: u32) -> Square {
+/// Returns `None` if the indices are out of range.
+pub(crate) fn get_square(file: u32, rank: u32) -> Option<Square> {
     let f = match file {
         0 => File::A,
         1 => File::B,
@@ -111,7 +103,7 @@ pub(crate) fn get_square(file: u32, rank: u32) -> Square {
         5 => File::F,
         6 => File::G,
         7 => File::H,
-        _ => unreachable!(),
+        _ => return None,
     };
     let r = match rank {
         0 => Rank::First,
@@ -122,54 +114,52 @@ pub(crate) fn get_square(file: u32, rank: u32) -> Square {
         5 => Rank::Sixth,
         6 => Rank::Seventh,
         7 => Rank::Eighth,
-        _ => unreachable!(),
+        _ => return None,
     };
-    Square::make_square(r, f)
+    Some(Square::make_square(r, f))
 }
 
-/// Checks the board state to determine if the game has ended.
-///
-/// Returns `Some(GameResult)` if the side to move has no legal moves:
-/// - If the king is in check → checkmate (winner is the other side).
-/// - If the king is not in check → stalemate (draw).
+/// Checks the board state for checkmate or stalemate using `Board::status()`.
+/// Returns `Some(GameResult)` if the game has ended.
 fn check_game_result(board: &Board) -> Option<GameResult> {
-    let mut move_gen = MoveGen::new_legal(board);
-    if move_gen.next().is_none() {
-        // No legal moves → checkmate or stalemate
-        if board.checkers().0 == 0 {
-            Some(GameResult::Draw) // Stalemate
-        } else if board.side_to_move() == ChessColor::White {
-            Some(GameResult::BlackWins) // Checkmate: White to move but in check
-        } else {
-            Some(GameResult::WhiteWins) // Checkmate: Black to move but in check
+    match board.status() {
+        BoardStatus::Checkmate => {
+            if board.side_to_move() == ChessColor::White {
+                Some(GameResult::BlackWins)
+            } else {
+                Some(GameResult::WhiteWins)
+            }
         }
-    } else {
-        None
+        BoardStatus::Stalemate => Some(GameResult::Draw),
+        _ => None,
     }
 }
 
 /// Configuration for the chess GUI appearance and behaviour.
-///
-/// Use the builder‑style or direct field assignment to customise the look and optional
-/// engine path. All fields have sensible defaults.
 #[derive(Debug, Clone)]
 pub struct ChessConfig {
-    /// Colour of the light squares. Default is an off‑white (`#fffdcc`).
+    /// Colour of the light squares. Default: off‑white (`#fffdcc`).
     pub light_square_color: Color,
-    /// Colour of the dark squares. Default is `GRAY`.
+    /// Colour of the dark squares. Default: `GRAY`.
     pub dark_square_color: Color,
+    /// Size of each square in pixels. Default: 64.
+    pub square_size: f32,
+    /// Offset of the board from the top‑left corner of the window. Only used when `center_board` is `false`.
+    /// Default: (0.0, 0.0).
+    pub board_offset: (f32, f32),
+    /// If `true`, the board is automatically centered in the window (ignoring `board_offset`). Default: `true`.
+    pub center_board: bool,
+    /// Whether to automatically flip the board perspective after each move. Default: true.
+    pub auto_flip_perspective: bool,
+    /// The piece to promote to when a pawn reaches the last rank. Default: Queen.
+    pub promotion_piece: ChessPiece,
     /// Optional path to a custom piece texture sheet (PNG, 384×128).
     /// If `None`, the built‑in default pieces are used.
     pub piece_texture_path: Option<String>,
-    /// Whether to automatically flip the board perspective after each move.
-    /// Default: `true` (flip so the side to move is at the bottom).
-    pub auto_flip_perspective: bool,
-    /// If set, plays against a UCI engine at this path as Black.
-    /// This field is only available when the `uci` feature is enabled.
+    /// If set, plays against a UCI engine at this path.
     #[cfg(feature = "uci")]
     pub uci_engine_path: Option<String>,
-    /// Which side the UCI engine should play (if `uci_engine_path` is set).
-    /// Default: `ChessColor::Black`.
+    /// Which side the UCI engine should play. Default: `ChessColor::Black`.
     #[cfg(feature = "uci")]
     pub uci_plays_as: ChessColor,
     /// Time (in milliseconds) to give the engine per move. Default: 1000 ms.
@@ -182,8 +172,12 @@ impl Default for ChessConfig {
         Self {
             light_square_color: Color::new(255. / 255., 253. / 255., 208. / 255., 1.),
             dark_square_color: GRAY,
-            piece_texture_path: None,
+            square_size: 64.0,
+            board_offset: (0.0, 0.0),
+            center_board: true,
             auto_flip_perspective: true,
+            promotion_piece: ChessPiece::Queen,
+            piece_texture_path: None,
             #[cfg(feature = "uci")]
             uci_engine_path: None,
             #[cfg(feature = "uci")]
@@ -194,11 +188,8 @@ impl Default for ChessConfig {
     }
 }
 
-/// Internal representation of a piece for rendering mapping.
-///
-/// This enum maps each chess piece + colour combination to a unique variant.
-/// It provides the source rectangle coordinates inside the 384×128 texture atlas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Internal representation of a piece for rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RenderPiece {
     WhiteKing,
     WhiteQueen,
@@ -215,7 +206,6 @@ enum RenderPiece {
 }
 
 impl RenderPiece {
-    /// Converts a `chess::Piece` and `chess::Color` into a `RenderPiece`.
     fn from_chess(piece: ChessPiece, color: ChessColor) -> Self {
         match (color, piece) {
             (ChessColor::White, ChessPiece::King) => RenderPiece::WhiteKing,
@@ -233,7 +223,6 @@ impl RenderPiece {
         }
     }
 
-    /// Returns the `(x, y)` top‑left corner of the 64×64 sprite in the texture atlas.
     fn tex_coords(&self) -> (f32, f32) {
         match self {
             RenderPiece::WhiteKing => (0.0, 0.0),
@@ -253,46 +242,23 @@ impl RenderPiece {
 }
 
 /// The main Chess GUI struct.
-///
-/// Holds the current board state, configuration, loaded texture, interaction state,
-/// and game result. You create one instance and call [`update`](ChessGui::update)
-/// in your game loop.
 pub struct ChessGui {
-    /// The current chess board (from the `chess` crate).
     board: Board,
-    /// Configuration for appearance and optional engine.
     config: ChessConfig,
-    /// Loaded piece texture (optional until loaded).
     pieces_texture: Option<Texture2D>,
-    /// The square that is currently selected (clicked) by the user.
     selected_square: Option<Square>,
-    /// If a piece is being dragged, stores the source square and the offset
-    /// from the mouse click to the top‑left of the square.
     dragging_piece: Option<(Square, f32, f32)>,
-    /// Which side is shown at the bottom of the board (White or Black).
     perspective: ChessColor,
-    /// The result of the game, if it has ended.
     game_result: Option<GameResult>,
-    /// A status message (e.g., "White Wins!", "Game Drawn").
     status_message: String,
+    // Cached rectangles for piece sprites to avoid re‑creation
+    piece_rects: std::collections::HashMap<RenderPiece, Rect>,
 
-    // UCI engine integration (only when feature is enabled)
     #[cfg(feature = "uci")]
-    uci_engine: Option<UciEngine>,
+    uci_engine: Option<uci::UciEngine>,
 }
 
 impl ChessGui {
-    /// Creates a new chess GUI with the given configuration.
-    ///
-    /// The board is initialised to the standard starting position.
-    /// The piece texture is not loaded yet – you must call [`load_pieces`](ChessGui::load_pieces)
-    /// before rendering.
-    ///
-    /// # Example
-    /// ```
-    /// let config = ChessConfig::default();
-    /// let gui = ChessGui::new(config);
-    /// ```
     pub fn new(config: ChessConfig) -> Self {
         Self {
             board: Board::default(),
@@ -303,31 +269,29 @@ impl ChessGui {
             perspective: ChessColor::White,
             game_result: None,
             status_message: String::new(),
+            piece_rects: std::collections::HashMap::new(),
             #[cfg(feature = "uci")]
             uci_engine: None,
         }
     }
 
-    /// Loads the piece textures from the configured path or falls back to the built‑in default.
-    ///
-    /// This method should be called once before the main loop, or at least before the first
-    /// call to [`update`](ChessGui::update). It reads the file asynchronously (using `std::fs`
-    /// in a blocking manner – see note below).
-    ///
-    /// # Blocking I/O
-    ///
-    /// This method uses synchronous `std::fs::read`, which may block the async executor.
-    /// In a real application you might want to load textures asynchronously; this is a
-    /// simplification suitable for most Macroquad games.
-    ///
-    /// # Errors
-    ///
-    /// If the custom path fails to load, an error is printed to stderr and the default
-    /// texture is used instead. If the loaded image does not have the expected dimensions
-    /// (384×128), a warning is printed, but the texture is still used.
+    /// Returns the current board offset (either the configured offset or centered, depending on `center_board`).
+    fn get_board_offset(&self) -> (f32, f32) {
+        if self.config.center_board {
+            let board_pixels = self.config.square_size * 8.0;
+            let ox = (screen_width() - board_pixels) / 2.0;
+            let oy = (screen_height() - board_pixels) / 2.0;
+            (ox, oy)
+        } else {
+            self.config.board_offset
+        }
+    }
+
+    /// Asynchronously loads the piece texture from the configured path or falls back to the default.
+    /// Uses `macroquad::file::load_file` for non‑blocking I/O.
     pub async fn load_pieces(&mut self) {
         let image_data = if let Some(ref path) = self.config.piece_texture_path {
-            match std::fs::read(path) {
+            match load_file(path).await {
                 Ok(data) => data,
                 Err(e) => {
                     eprintln!(
@@ -341,22 +305,42 @@ impl ChessGui {
             DEFAULT_PIECES_PNG.to_vec()
         };
 
-        self.pieces_texture = Some(Texture2D::from_file_with_format(&image_data, None));
+        let tex = Texture2D::from_file_with_format(&image_data, None);
+        tex.set_filter(FilterMode::Nearest);
 
-        if let Some(tex) = &self.pieces_texture {
-            if tex.width() as u32 != 384 || tex.height() as u32 != 128 {
-                eprintln!(
-                    "Warning: piece texture is {}x{}, expected 384x128.",
-                    tex.width(),
-                    tex.height()
-                );
-            }
+        if tex.width() as u32 != 384 || tex.height() as u32 != 128 {
+            eprintln!(
+                "Warning: piece texture is {}x{}, expected 384x128.",
+                tex.width(),
+                tex.height()
+            );
         }
 
-        // Initialize UCI engine if configured
+        // Pre‑cache piece rectangles
+        for variant in [
+            RenderPiece::WhiteKing,
+            RenderPiece::WhiteQueen,
+            RenderPiece::WhiteBishop,
+            RenderPiece::WhiteKnight,
+            RenderPiece::WhiteRook,
+            RenderPiece::WhitePawn,
+            RenderPiece::BlackKing,
+            RenderPiece::BlackQueen,
+            RenderPiece::BlackBishop,
+            RenderPiece::BlackKnight,
+            RenderPiece::BlackRook,
+            RenderPiece::BlackPawn,
+        ] {
+            let (x, y) = variant.tex_coords();
+            self.piece_rects
+                .insert(variant, Rect::new(x, y, 64.0, 64.0));
+        }
+
+        self.pieces_texture = Some(tex);
+
         #[cfg(feature = "uci")]
         if let Some(ref path) = self.config.uci_engine_path {
-            match UciEngine::new(path, self.config.uci_move_time_ms) {
+            match uci::UciEngine::new(path, self.config.uci_move_time_ms) {
                 Ok(engine) => {
                     self.uci_engine = Some(engine);
                     eprintln!("UCI engine started: {}", path);
@@ -369,26 +353,8 @@ impl ChessGui {
         }
     }
 
-    /// Updates the GUI: draws the board, handles user input, and processes engine moves.
-    ///
-    /// This method must be called once per frame in your game loop. It assumes that
-    /// the Macroquad context is active and that the window is at least 512×512 pixels.
-    /// It clears the background with the light square colour, draws the board and pieces,
-    /// and processes mouse events.
-    ///
-    /// # Game Flow
-    ///
-    /// - If the game is not over, the user can interact with pieces via click‑and‑drag.
-    /// - If the `uci` feature is enabled and an engine path is set, the engine moves
-    ///   automatically when it's its turn (background thread).
-    /// - When the game ends, an overlay message is shown and pressing the `R` key restarts.
-    ///
-    /// # Panics
-    ///
-    /// This method may panic if the piece texture is not loaded before calling it;
-    /// however it will display an error text instead of crashing.
+    /// Updates the GUI: draws the board, handles input, and processes engine moves.
     pub async fn update(&mut self) {
-        // Check for game end
         if self.game_result.is_none() {
             self.game_result = check_game_result(&self.board);
             if let Some(result) = &self.game_result {
@@ -400,50 +366,60 @@ impl ChessGui {
             }
         }
 
-        clear_background(self.config.light_square_color);
+        clear_background(Color::new(180. / 255., 220. / 255., 255. / 255., 1.));
         self.draw_board();
 
         if self.game_result.is_none() {
-            // Handle human input
             self.handle_input();
 
-            // Check for UCI engine move (if enabled and it's engine's turn)
             #[cfg(feature = "uci")]
             if let Some(ref mut engine) = self.uci_engine {
-                // Only query engine if it's its turn and we are not dragging and no move is pending
                 if self.board.side_to_move() == self.config.uci_plays_as
                     && self.dragging_piece.is_none()
                     && !engine.has_pending_move()
                 {
-                    // Ask engine to compute a move asynchronously
                     let fen = self.board.to_string();
                     engine.request_move(fen);
                 }
 
-                // Check if engine has produced a move
                 if let Some(m) = engine.try_take_move() {
                     if self.try_move(m) {
-                        // Move applied successfully
+                        // move applied
                     } else {
                         eprintln!("Engine played an illegal move! Ignoring.");
                     }
                 }
             }
         } else {
-            // Draw End Game Message
+            // End game overlay – centered on the board
+            let board_pixels = self.config.square_size * 8.0;
+            let (ox, oy) = self.get_board_offset();
+
+            draw_rectangle(
+                ox,
+                oy,
+                board_pixels,
+                board_pixels,
+                Color::new(0., 0., 0., 0.6),
+            );
+
+            let msg = &self.status_message;
+            let msg_size = measure_text(msg, None, 40, 1.0);
             draw_text(
-                &self.status_message,
-                512.0 / 2.0 - measure_text(&self.status_message, None, 40, 1.0).width / 2.0,
-                512.0 / 2.0,
+                msg,
+                ox + board_pixels / 2.0 - msg_size.width / 2.0,
+                oy + board_pixels / 2.0 - 20.0,
                 40.0,
                 RED,
             );
+            let restart_msg = "Press R to Restart";
+            let restart_size = measure_text(restart_msg, None, 20, 1.0);
             draw_text(
-                "Press R to Restart",
-                512.0 / 2.0 - measure_text("Press R to Restart", None, 20, 1.0).width / 2.0,
-                512.0 / 2.0 + 40.0,
+                restart_msg,
+                ox + board_pixels / 2.0 - restart_size.width / 2.0,
+                oy + board_pixels / 2.0 + 30.0,
                 20.0,
-                BLACK,
+                WHITE,
             );
 
             if is_key_pressed(KeyCode::R) {
@@ -452,10 +428,6 @@ impl ChessGui {
         }
     }
 
-    /// Resets the game to the initial position.
-    ///
-    /// Clears the board, selected square, dragging state, sets perspective to White,
-    /// and clears the game result and status message.
     fn restart(&mut self) {
         self.board = Board::default();
         self.selected_square = None;
@@ -463,23 +435,20 @@ impl ChessGui {
         self.perspective = ChessColor::White;
         self.game_result = None;
         self.status_message.clear();
-        // Notify UCI engine of new game if needed (optional)
         #[cfg(feature = "uci")]
         if let Some(ref mut engine) = self.uci_engine {
             engine.reset();
         }
     }
 
-    /// Draws the board, pieces, and any dragged piece.
-    ///
-    /// This method is called by [`update`](ChessGui::update) and assumes the texture is loaded.
-    /// It draws all 64 squares, then pieces (except the one being dragged), and finally
-    /// the dragged piece on top.
     fn draw_board(&self) {
         let Some(texture) = &self.pieces_texture else {
             draw_text("Load pieces texture first!", 100.0, 256.0, 20.0, RED);
             return;
         };
+
+        let size = self.config.square_size;
+        let (ox, oy) = self.get_board_offset();
 
         for rank in 0..8 {
             for file in 0..8 {
@@ -490,41 +459,113 @@ impl ChessGui {
                     self.config.dark_square_color
                 };
 
-                // Calculate screen coordinates based on perspective
                 let (screen_x, screen_y) = if self.perspective == ChessColor::White {
-                    (file as f32 * 64.0, (7 - rank) as f32 * 64.0)
+                    (ox + file as f32 * size, oy + (7 - rank) as f32 * size)
                 } else {
-                    ((7 - file) as f32 * 64.0, rank as f32 * 64.0)
+                    (ox + (7 - file) as f32 * size, oy + rank as f32 * size)
                 };
 
-                draw_rectangle(screen_x, screen_y, 64.0, 64.0, color);
+                draw_rectangle(screen_x, screen_y, size, size, color);
 
-                let sq = get_square(file as u32, rank as u32);
+                let sq = match get_square(file as u32, rank as u32) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                if Some(sq) == self.selected_square {
+                    draw_rectangle(
+                        screen_x,
+                        screen_y,
+                        size,
+                        size,
+                        Color::new(1.0, 1.0, 0.0, 0.3),
+                    );
+                }
+
+                if let Some(sel_sq) = self.selected_square {
+                    if let Some(_piece) = self.board.piece_on(sel_sq) {
+                        if self.board.color_on(sel_sq) == Some(self.board.side_to_move()) {
+                            let moves = MoveGen::new_legal(&self.board)
+                                .filter(|m| m.get_source() == sel_sq)
+                                .map(|m| m.get_dest())
+                                .collect::<Vec<_>>();
+                            if moves.contains(&sq) {
+                                let cx = screen_x + size / 2.0;
+                                let cy = screen_y + size / 2.0;
+                                draw_circle(cx, cy, size / 6.0, Color::new(0.0, 0.0, 0.0, 0.4));
+                                if self.board.piece_on(sq).is_some() {
+                                    draw_circle(cx, cy, size / 3.0, Color::new(0.0, 0.0, 0.0, 0.4));
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if let Some(piece) = self.board.piece_on(sq) {
                     let color_on_sq = self.board.color_on(sq).unwrap();
                     let render_piece = RenderPiece::from_chess(piece, color_on_sq);
 
-                    // Don't draw if dragging this specific piece
                     if let Some((drag_sq, _, _)) = self.dragging_piece {
                         if drag_sq == sq {
                             continue;
                         }
                     }
 
-                    let (tx, ty) = render_piece.tex_coords();
-                    draw_texture_ex(
-                        texture,
-                        screen_x,
-                        screen_y,
-                        WHITE,
-                        DrawTextureParams {
-                            source: Some(Rect::new(tx, ty, 64.0, 64.0)),
-                            ..Default::default()
-                        },
-                    );
+                    if let Some(rect) = self.piece_rects.get(&render_piece) {
+                        draw_texture_ex(
+                            texture,
+                            screen_x,
+                            screen_y,
+                            WHITE,
+                            DrawTextureParams {
+                                source: Some(*rect),
+                                dest_size: Some(Vec2::new(size, size)),
+                                rotation: 0.0,
+                                flip_x: false,
+                                flip_y: false,
+                                pivot: None,
+                            },
+                        );
+                    }
                 }
             }
+        }
+
+        // Draw board coordinates (file letters, rank numbers)
+        let font_size = (size / 4.0) as u16;
+        for i in 0..8 {
+            let file_label = (b'a' + i as u8) as char;
+            let rank_label = (b'1' + i as u8) as char;
+
+            // File labels (bottom)
+            let x = if self.perspective == ChessColor::White {
+                ox + i as f32 * size + size / 2.0
+            } else {
+                ox + (7 - i) as f32 * size + size / 2.0
+            };
+            let y_bottom = oy + 8.0 * size + 5.0;
+            draw_text(
+                &file_label.to_string(),
+                x - measure_text(&file_label.to_string(), None, font_size, 1.0).width / 2.0,
+                y_bottom + font_size as f32,
+                font_size as f32,
+                BLACK,
+            );
+
+            // Rank labels (left)
+            let y = if self.perspective == ChessColor::White {
+                oy + (7 - i) as f32 * size + size / 2.0
+            } else {
+                oy + i as f32 * size + size / 2.0
+            };
+            let x_left = ox - 20.0;
+            draw_text(
+                &rank_label.to_string(),
+                x_left,
+                y + font_size as f32 / 2.0,
+                font_size as f32,
+                BLACK,
+            );
         }
 
         // Draw dragged piece
@@ -534,35 +575,33 @@ impl ChessGui {
                 let render_piece = RenderPiece::from_chess(piece, color_on_sq);
                 let (mx, my) = mouse_position();
 
-                let (tx, ty) = render_piece.tex_coords();
-                draw_texture_ex(
-                    texture,
-                    mx - offset_x,
-                    my - offset_y,
-                    WHITE,
-                    DrawTextureParams {
-                        source: Some(Rect::new(tx, ty, 64.0, 64.0)),
-                        ..Default::default()
-                    },
-                );
+                if let Some(rect) = self.piece_rects.get(&render_piece) {
+                    draw_texture_ex(
+                        texture,
+                        mx - offset_x,
+                        my - offset_y,
+                        WHITE,
+                        DrawTextureParams {
+                            source: Some(*rect),
+                            dest_size: Some(Vec2::new(size, size)),
+                            rotation: 0.0,
+                            flip_x: false,
+                            flip_y: false,
+                            pivot: None,
+                        },
+                    );
+                }
             }
         }
     }
 
-    /// Processes mouse input for piece selection, dragging, and move execution.
-    ///
-    /// This method is called only when the game is not over. It handles:
-    /// - Left mouse button press: select a piece if it belongs to the side to move.
-    /// - Mouse movement while dragging: updates the dragged piece position (handled by the render loop).
-    /// - Left mouse button release: attempt to move the selected piece to the target square.
-    ///
-    /// If the move is legal, it is executed, the board is updated, perspective is flipped
-    /// (if configured), and the game result is re‑evaluated in the next call to [`update`](ChessGui::update).
     fn handle_input(&mut self) {
         let (mx, my) = mouse_position();
+        let size = self.config.square_size;
+        let (ox, oy) = self.get_board_offset();
 
-        let file = (mx / 64.0) as i32;
-        let rank = (my / 64.0) as i32;
+        let file = ((mx - ox) / size) as i32;
+        let rank = ((my - oy) / size) as i32;
 
         if file < 0 || file > 7 || rank < 0 || rank > 7 {
             if is_mouse_button_released(MouseButton::Left) {
@@ -572,7 +611,6 @@ impl ChessGui {
             return;
         }
 
-        // Map screen coordinates to logical board coordinates based on perspective
         let logical_file = if self.perspective == ChessColor::White {
             file
         } else {
@@ -584,18 +622,26 @@ impl ChessGui {
             rank
         };
 
-        let sq = get_square(logical_file as u32, logical_rank as u32);
+        let sq = match get_square(logical_file as u32, logical_rank as u32) {
+            Some(s) => s,
+            None => return,
+        };
 
         if is_mouse_button_pressed(MouseButton::Left) {
             if let Some(_piece) = self.board.piece_on(sq) {
                 if self.board.color_on(sq) == Some(self.board.side_to_move()) {
                     self.selected_square = Some(sq);
 
-                    // Calculate exact offset based on where the user clicked
                     let (screen_x, screen_y) = if self.perspective == ChessColor::White {
-                        (logical_file as f32 * 64.0, (7 - logical_rank) as f32 * 64.0)
+                        (
+                            ox + logical_file as f32 * size,
+                            oy + (7 - logical_rank) as f32 * size,
+                        )
                     } else {
-                        ((7 - logical_file) as f32 * 64.0, logical_rank as f32 * 64.0)
+                        (
+                            ox + (7 - logical_file) as f32 * size,
+                            oy + logical_rank as f32 * size,
+                        )
                     };
                     let offset_x = mx - screen_x;
                     let offset_y = my - screen_y;
@@ -606,12 +652,14 @@ impl ChessGui {
         } else if is_mouse_button_released(MouseButton::Left) {
             if let Some(from_sq) = self.selected_square {
                 if from_sq != sq {
-                    // Auto-promote to Queen for simplicity
                     let promote_to = if self.board.piece_on(from_sq) == Some(ChessPiece::Pawn) {
-                        if (self.board.side_to_move() == ChessColor::White && logical_rank == 7)
-                            || (self.board.side_to_move() == ChessColor::Black && logical_rank == 0)
-                        {
-                            Some(ChessPiece::Queen)
+                        let promo_rank = if self.board.side_to_move() == ChessColor::White {
+                            7
+                        } else {
+                            0
+                        };
+                        if logical_rank == promo_rank {
+                            Some(self.config.promotion_piece)
                         } else {
                             None
                         }
@@ -621,7 +669,6 @@ impl ChessGui {
 
                     let chess_move = ChessMove::new(from_sq, sq, promote_to);
                     if self.board.legal(chess_move) {
-                        // Use try_move to apply and handle perspective flip
                         self.try_move(chess_move);
                     }
                 }
@@ -631,22 +678,30 @@ impl ChessGui {
         }
     }
 
-    // ---------- Public API extensions ----------
+    // ---------- Public API ----------
 
-    /// Returns a reference to the current board.
     pub fn board(&self) -> &Board {
         &self.board
     }
 
-    /// Returns the current perspective (which side is at the bottom).
     pub fn perspective(&self) -> ChessColor {
         self.perspective
     }
 
-    /// Attempts to make a move on the board.
-    /// Returns `true` if the move was legal and applied.
-    ///
-    /// The perspective is flipped if `auto_flip_perspective` is `true`.
+    pub fn fen(&self) -> String {
+        self.board.to_string()
+    }
+
+    /// Returns the current effective board offset (computed or stored).
+    pub fn board_offset(&self) -> (f32, f32) {
+        self.get_board_offset()
+    }
+
+    pub fn square_size(&self) -> f32 {
+        self.config.square_size
+    }
+
+    /// Attempts to make a move. Returns `true` if legal and applied.
     pub fn try_move(&mut self, m: ChessMove) -> bool {
         if self.board.legal(m) {
             self.board = self.board.make_move_new(m);
@@ -663,22 +718,28 @@ impl ChessGui {
         }
     }
 
-    /// Sets the board position from a FEN string.
-    /// Returns `Ok(())` on success, or an error string if the FEN is invalid.
+    /// Sets the board from a FEN string.
     pub fn set_fen(&mut self, fen: &str) -> Result<(), String> {
-        match Board::from_str(fen) {
-            Ok(b) => {
+        Board::from_str(fen)
+            .map(|b| {
                 self.board = b;
                 self.game_result = None;
                 self.status_message.clear();
                 self.selected_square = None;
                 self.dragging_piece = None;
-                // Optionally reset perspective based on side to move
                 self.perspective = self.board.side_to_move();
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
-        }
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Sets the board directly from a `Board` instance.
+    pub fn set_board(&mut self, board: Board) {
+        self.board = board;
+        self.game_result = None;
+        self.status_message.clear();
+        self.selected_square = None;
+        self.dragging_piece = None;
+        self.perspective = self.board.side_to_move();
     }
 
     /// Returns the list of legal moves for the side to move.
@@ -698,26 +759,18 @@ mod uci {
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
+    use std::time::Duration;
 
-    /// A simple UCI engine controller that runs in a separate thread.
     pub struct UciEngine {
-        // Channel to send FEN strings to the engine thread
+        child: Child,
+        stdin: std::process::ChildStdin,
         request_sender: Sender<String>,
-        // Channel to receive computed moves (as ChessMove) from the engine thread
         response_receiver: Receiver<ChessMove>,
-        // Flag to indicate that a move is currently being computed
         has_pending: bool,
+        reader_thread: Option<thread::JoinHandle<()>>,
     }
 
     impl UciEngine {
-        /// Starts a new UCI engine process.
-        ///
-        /// # Arguments
-        /// * `path` – Path to the UCI engine executable.
-        /// * `move_time_ms` – Time in milliseconds allocated per move.
-        ///
-        /// # Errors
-        /// Returns an error string if the engine fails to start or does not respond to `uci` command.
         pub fn new(path: &str, move_time_ms: u64) -> Result<Self, String> {
             let mut child = Command::new(path)
                 .stdin(Stdio::piped())
@@ -730,13 +783,11 @@ mod uci {
             let stdout = child.stdout.take().expect("failed to open stdout");
             let mut reader = BufReader::new(stdout);
 
-            // Send UCI handshake
             stdin
                 .write_all(b"uci\n")
                 .and_then(|_| stdin.flush())
                 .map_err(|e| format!("Failed to write to engine: {}", e))?;
 
-            // Wait for "uciok" to confirm engine is ready
             let mut line = String::new();
             let mut ready = false;
             while let Ok(n) = reader.read_line(&mut line) {
@@ -754,34 +805,35 @@ mod uci {
                 return Err("Engine did not respond with 'uciok'".to_string());
             }
 
-            // Create channels for communication
+            stdin
+                .write_all(b"ucinewgame\n")
+                .and_then(|_| stdin.flush())
+                .map_err(|e| format!("Failed to write 'ucinewgame': {}", e))?;
+
             let (req_tx, req_rx) = mpsc::channel();
             let (res_tx, res_rx) = mpsc::channel();
 
-            // Spawn the engine thread
-            thread::spawn(move || {
+            let reader_thread = thread::spawn(move || {
                 engine_thread_loop(child, stdin, reader, req_rx, res_tx, move_time_ms);
             });
 
             Ok(UciEngine {
+                child,
+                stdin,
                 request_sender: req_tx,
                 response_receiver: res_rx,
                 has_pending: false,
+                reader_thread: Some(reader_thread),
             })
         }
 
-        /// Request the engine to compute a move for the given FEN position.
-        /// This is non‑blocking; the result will be available via `try_take_move()`.
         pub fn request_move(&mut self, fen: String) {
             if !self.has_pending {
-                // Send the FEN to the engine thread
                 let _ = self.request_sender.send(fen);
                 self.has_pending = true;
             }
         }
 
-        /// Checks if a move has been produced by the engine.
-        /// If yes, returns the move and clears the pending flag.
         pub fn try_take_move(&mut self) -> Option<ChessMove> {
             if let Ok(m) = self.response_receiver.try_recv() {
                 self.has_pending = false;
@@ -791,21 +843,29 @@ mod uci {
             }
         }
 
-        /// Returns `true` if a move is currently being computed.
         pub fn has_pending_move(&self) -> bool {
             self.has_pending
         }
 
-        /// Reset the engine's state (e.g., for a new game).
-        /// Currently does nothing; could send `ucinewgame` if needed.
         pub fn reset(&mut self) {
-            // Optional: send "ucinewgame" to engine.
-            // For simplicity we ignore.
             self.has_pending = false;
+            let _ = self.stdin.write_all(b"ucinewgame\n");
+            let _ = self.stdin.flush();
+            while let Ok(_) = self.response_receiver.try_recv() {}
         }
     }
 
-    /// The main loop running in the engine thread.
+    impl Drop for UciEngine {
+        fn drop(&mut self) {
+            let _ = self.stdin.write_all(b"quit\n");
+            let _ = self.stdin.flush();
+            let _ = self.child.kill();
+            if let Some(handle) = self.reader_thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     fn engine_thread_loop(
         mut child: Child,
         mut stdin: std::process::ChildStdin,
@@ -814,20 +874,12 @@ mod uci {
         response_tx: Sender<ChessMove>,
         move_time_ms: u64,
     ) {
-        // We'll read engine output asynchronously in a loop.
-        // We need to watch for "bestmove" lines and also handle requests.
-        // This simplified version uses blocking reads; we will use a separate thread
-        // to read engine output, or we can do non-blocking I/O. Since we are in a
-        // dedicated thread, we can block on reads.
-
-        // We'll spawn a reader thread that continuously reads lines and forwards
-        // any "bestmove" to the response channel.
         let (line_tx, line_rx) = mpsc::channel();
         let reader_handle = thread::spawn(move || {
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line) {
                 if n == 0 {
-                    break; // EOF
+                    break;
                 }
                 if let Some(bestmove) = parse_bestmove(&line) {
                     let _ = line_tx.send(bestmove);
@@ -836,58 +888,57 @@ mod uci {
             }
         });
 
-        // Main loop: wait for request, send position + go, then wait for bestmove.
-        // We'll use a loop that checks for new requests and also listens for engine output.
-        // Since we have a separate reader thread, we can just wait for a request,
-        // then send commands, and then wait for the response via line_rx.
-        // We'll also need to handle engine termination.
-
         loop {
-            // Wait for a request (blocking).
             let fen = match request_rx.recv() {
                 Ok(f) => f,
-                Err(_) => break, // sender dropped -> exit
+                Err(_) => break,
             };
 
-            // Send position and go commands.
             let cmd = format!("position fen {}\ngo movetime {}\n", fen, move_time_ms);
             if let Err(e) = stdin.write_all(cmd.as_bytes()).and_then(|_| stdin.flush()) {
                 eprintln!("Error writing to engine: {}", e);
                 break;
             }
 
-            // Wait for the response (bestmove) from the reader thread.
-            // We'll use a timeout to avoid hanging if engine fails.
-            // Using recv_timeout is not stable in std; we can use recv() with a loop
-            // and check for engine process termination.
-            match line_rx.recv() {
-                Ok(m) => {
-                    let _ = response_tx.send(m);
+            let timeout = Duration::from_millis(move_time_ms + 500);
+            let start = std::time::Instant::now();
+            let mut move_received = None;
+            while start.elapsed() < timeout {
+                if let Ok(m) = line_rx.try_recv() {
+                    move_received = Some(m);
+                    break;
                 }
-                Err(_) => break, // reader thread died
+                thread::sleep(Duration::from_millis(10));
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+            }
+
+            if let Some(m) = move_received {
+                let _ = response_tx.send(m);
+            } else {
+                eprintln!("Engine did not respond in time, assuming failure.");
+                break;
             }
         }
 
-        // Clean up
         let _ = child.kill();
         let _ = reader_handle.join();
     }
 
-    /// Parses a line of engine output to extract a `bestmove` command.
-    /// Returns `Some(ChessMove)` if the line contains a valid bestmove.
     fn parse_bestmove(line: &str) -> Option<ChessMove> {
         let trimmed = line.trim();
         if !trimmed.starts_with("bestmove") {
             return None;
         }
-        // Format: "bestmove e2e4" or "bestmove e2e4 ponder ..."
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() < 2 {
             return None;
         }
         let move_str = parts[1];
-        // Convert UCI move string to ChessMove
-        // UCI format: e2e4, e7e8q (promotion)
+        if move_str == "(none)" {
+            return None;
+        }
         let bytes = move_str.as_bytes();
         if bytes.len() < 4 {
             return None;
@@ -896,8 +947,8 @@ mod uci {
         let from_rank = (bytes[1] - b'1') as u32;
         let to_file = (bytes[2] - b'a') as u32;
         let to_rank = (bytes[3] - b'1') as u32;
-        let from_sq = super::get_square(from_file, from_rank);
-        let to_sq = super::get_square(to_file, to_rank);
+        let from_sq = super::get_square(from_file, from_rank)?;
+        let to_sq = super::get_square(to_file, to_rank)?;
         let promotion = if bytes.len() >= 5 {
             match bytes[4] {
                 b'q' => Some(ChessPiece::Queen),
@@ -913,6 +964,5 @@ mod uci {
     }
 }
 
-// Re-export UciEngine if feature enabled
 #[cfg(feature = "uci")]
 pub use uci::UciEngine;
