@@ -5,8 +5,9 @@
 //! This crate provides a ready‑to‑use chess board widget that handles:
 //! - Rendering the board and pieces from a texture atlas.
 //! - Valid move generation and enforcement via the [`chess`](https://crates.io/crates/chess) crate.
-//! - Two‑player local play with automatic board flip after each move.
-//! - Optional UCI engine integration (behind the `uci` feature flag).
+//! - Two‑player local play with automatic board flip after each move (optional).
+//! - Optional UCI engine integration (behind the `uci` feature flag) – now with proper asynchronous
+//!   communication via a background thread.
 //! - Endgame detection (checkmate, stalemate) and a restart button.
 //!
 //! ## Quick Start
@@ -35,8 +36,7 @@
 //!
 //! - **`uci`** – enables UCI engine support. When this feature is active, you can set
 //!   [`uci_engine_path`](ChessConfig::uci_engine_path) to play against a UCI‑compatible engine.
-//!   The engine will move as Black (this is a placeholder implementation that only plays the first
-//!   legal move; a full engine integration is left as an exercise for the user).
+//!   The engine moves as Black (configurable via `uci_plays_as`).
 //!
 //! ## Piece Texture Specification
 //!
@@ -64,14 +64,12 @@
 //! 1. The game starts with a standard starting position.
 //! 2. Players take turns by clicking and dragging pieces.
 //! 3. Legal moves are enforced; pawn promotion is automatically done to a Queen.
-//! 4. After each move, the board flips to show the opponent’s perspective.
+//! 4. After each move, the board flips to show the opponent’s perspective if `auto_flip_perspective` is `true`.
 //! 5. When checkmate or stalemate occurs, an overlay message is shown and the user can press `R` to restart.
-//! 6. If the `uci` feature is enabled and an engine path is set, the engine moves as Black.
-//!
-//! ## Customisation
-//!
-//! Use [`ChessConfig`] to change the square colours and optionally provide a custom piece sheet.
-//! You can also enable UCI engine play.
+//! 6. If the `uci` feature is enabled and an engine path is set, the engine moves as configured
+//!    (by default as Black) using an asynchronous background process.
+
+use std::str::FromStr;
 
 use chess::{
     Board, ChessMove, Color as ChessColor, File, MoveGen, Piece as ChessPiece, Rank, Square,
@@ -103,7 +101,7 @@ pub enum GameResult {
 /// # Panics
 /// This function uses `unreachable!()` if the input is outside 0..7.
 /// It is only called with valid indices from board iteration, so it is safe.
-fn get_square(file: u32, rank: u32) -> Square {
+pub(crate) fn get_square(file: u32, rank: u32) -> Square {
     let f = match file {
         0 => File::A,
         1 => File::B,
@@ -163,10 +161,20 @@ pub struct ChessConfig {
     /// Optional path to a custom piece texture sheet (PNG, 384×128).
     /// If `None`, the built‑in default pieces are used.
     pub piece_texture_path: Option<String>,
+    /// Whether to automatically flip the board perspective after each move.
+    /// Default: `true` (flip so the side to move is at the bottom).
+    pub auto_flip_perspective: bool,
     /// If set, plays against a UCI engine at this path as Black.
     /// This field is only available when the `uci` feature is enabled.
     #[cfg(feature = "uci")]
     pub uci_engine_path: Option<String>,
+    /// Which side the UCI engine should play (if `uci_engine_path` is set).
+    /// Default: `ChessColor::Black`.
+    #[cfg(feature = "uci")]
+    pub uci_plays_as: ChessColor,
+    /// Time (in milliseconds) to give the engine per move. Default: 1000 ms.
+    #[cfg(feature = "uci")]
+    pub uci_move_time_ms: u64,
 }
 
 impl Default for ChessConfig {
@@ -175,8 +183,13 @@ impl Default for ChessConfig {
             light_square_color: Color::new(255. / 255., 253. / 255., 208. / 255., 1.),
             dark_square_color: GRAY,
             piece_texture_path: None,
+            auto_flip_perspective: true,
             #[cfg(feature = "uci")]
             uci_engine_path: None,
+            #[cfg(feature = "uci")]
+            uci_plays_as: ChessColor::Black,
+            #[cfg(feature = "uci")]
+            uci_move_time_ms: 1000,
         }
     }
 }
@@ -262,6 +275,10 @@ pub struct ChessGui {
     game_result: Option<GameResult>,
     /// A status message (e.g., "White Wins!", "Game Drawn").
     status_message: String,
+
+    // UCI engine integration (only when feature is enabled)
+    #[cfg(feature = "uci")]
+    uci_engine: Option<UciEngine>,
 }
 
 impl ChessGui {
@@ -286,6 +303,8 @@ impl ChessGui {
             perspective: ChessColor::White,
             game_result: None,
             status_message: String::new(),
+            #[cfg(feature = "uci")]
+            uci_engine: None,
         }
     }
 
@@ -333,6 +352,21 @@ impl ChessGui {
                 );
             }
         }
+
+        // Initialize UCI engine if configured
+        #[cfg(feature = "uci")]
+        if let Some(ref path) = self.config.uci_engine_path {
+            match UciEngine::new(path, self.config.uci_move_time_ms) {
+                Ok(engine) => {
+                    self.uci_engine = Some(engine);
+                    eprintln!("UCI engine started: {}", path);
+                }
+                Err(e) => {
+                    eprintln!("Failed to start UCI engine: {}", e);
+                    self.uci_engine = None;
+                }
+            }
+        }
     }
 
     /// Updates the GUI: draws the board, handles user input, and processes engine moves.
@@ -346,7 +380,7 @@ impl ChessGui {
     ///
     /// - If the game is not over, the user can interact with pieces via click‑and‑drag.
     /// - If the `uci` feature is enabled and an engine path is set, the engine moves
-    ///   as Black automatically after each human move (it plays the first legal move found).
+    ///   automatically when it's its turn (background thread).
     /// - When the game ends, an overlay message is shown and pressing the `R` key restarts.
     ///
     /// # Panics
@@ -370,19 +404,28 @@ impl ChessGui {
         self.draw_board();
 
         if self.game_result.is_none() {
+            // Handle human input
             self.handle_input();
 
-            // UCI Engine Move (Placeholder)
+            // Check for UCI engine move (if enabled and it's engine's turn)
             #[cfg(feature = "uci")]
-            if let Some(ref _engine_path) = self.config.uci_engine_path {
-                if self.board.side_to_move() == ChessColor::Black && self.dragging_piece.is_none() {
-                    let moves: Vec<ChessMove> = MoveGen::new_legal(&self.board).collect();
-                    if !moves.is_empty() {
-                        let m = moves[0];
-                        // make_move_new returns the new board state immutably
-                        self.board = self.board.make_move_new(m);
-                        self.perspective = ChessColor::White;
-                        self.game_result = check_game_result(&self.board);
+            if let Some(ref mut engine) = self.uci_engine {
+                // Only query engine if it's its turn and we are not dragging and no move is pending
+                if self.board.side_to_move() == self.config.uci_plays_as
+                    && self.dragging_piece.is_none()
+                    && !engine.has_pending_move()
+                {
+                    // Ask engine to compute a move asynchronously
+                    let fen = self.board.to_string();
+                    engine.request_move(fen);
+                }
+
+                // Check if engine has produced a move
+                if let Some(m) = engine.try_take_move() {
+                    if self.try_move(m) {
+                        // Move applied successfully
+                    } else {
+                        eprintln!("Engine played an illegal move! Ignoring.");
                     }
                 }
             }
@@ -420,6 +463,11 @@ impl ChessGui {
         self.perspective = ChessColor::White;
         self.game_result = None;
         self.status_message.clear();
+        // Notify UCI engine of new game if needed (optional)
+        #[cfg(feature = "uci")]
+        if let Some(ref mut engine) = self.uci_engine {
+            engine.reset();
+        }
     }
 
     /// Draws the board, pieces, and any dragged piece.
@@ -508,8 +556,8 @@ impl ChessGui {
     /// - Mouse movement while dragging: updates the dragged piece position (handled by the render loop).
     /// - Left mouse button release: attempt to move the selected piece to the target square.
     ///
-    /// If the move is legal, it is executed, the board is updated, perspective is flipped,
-    /// and the game result is re‑evaluated in the next call to [`update`](ChessGui::update).
+    /// If the move is legal, it is executed, the board is updated, perspective is flipped
+    /// (if configured), and the game result is re‑evaluated in the next call to [`update`](ChessGui::update).
     fn handle_input(&mut self) {
         let (mx, my) = mouse_position();
 
@@ -573,14 +621,8 @@ impl ChessGui {
 
                     let chess_move = ChessMove::new(from_sq, sq, promote_to);
                     if self.board.legal(chess_move) {
-                        // make_move_new returns the new board state immutably
-                        self.board = self.board.make_move_new(chess_move);
-
-                        // Flip perspective for local two-player mode
-                        self.perspective = match self.perspective {
-                            ChessColor::White => ChessColor::Black,
-                            ChessColor::Black => ChessColor::White,
-                        };
+                        // Use try_move to apply and handle perspective flip
+                        self.try_move(chess_move);
                     }
                 }
                 self.selected_square = None;
@@ -588,4 +630,289 @@ impl ChessGui {
             }
         }
     }
+
+    // ---------- Public API extensions ----------
+
+    /// Returns a reference to the current board.
+    pub fn board(&self) -> &Board {
+        &self.board
+    }
+
+    /// Returns the current perspective (which side is at the bottom).
+    pub fn perspective(&self) -> ChessColor {
+        self.perspective
+    }
+
+    /// Attempts to make a move on the board.
+    /// Returns `true` if the move was legal and applied.
+    ///
+    /// The perspective is flipped if `auto_flip_perspective` is `true`.
+    pub fn try_move(&mut self, m: ChessMove) -> bool {
+        if self.board.legal(m) {
+            self.board = self.board.make_move_new(m);
+            if self.config.auto_flip_perspective {
+                self.perspective = match self.perspective {
+                    ChessColor::White => ChessColor::Black,
+                    ChessColor::Black => ChessColor::White,
+                };
+            }
+            self.game_result = check_game_result(&self.board);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sets the board position from a FEN string.
+    /// Returns `Ok(())` on success, or an error string if the FEN is invalid.
+    pub fn set_fen(&mut self, fen: &str) -> Result<(), String> {
+        match Board::from_str(fen) {
+            Ok(b) => {
+                self.board = b;
+                self.game_result = None;
+                self.status_message.clear();
+                self.selected_square = None;
+                self.dragging_piece = None;
+                // Optionally reset perspective based on side to move
+                self.perspective = self.board.side_to_move();
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Returns the list of legal moves for the side to move.
+    pub fn legal_moves(&self) -> Vec<ChessMove> {
+        MoveGen::new_legal(&self.board).collect()
+    }
 }
+
+// -----------------------------------------------------------------------------
+// UCI Engine integration (only when the feature is enabled)
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "uci")]
+mod uci {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread;
+
+    /// A simple UCI engine controller that runs in a separate thread.
+    pub struct UciEngine {
+        // Channel to send FEN strings to the engine thread
+        request_sender: Sender<String>,
+        // Channel to receive computed moves (as ChessMove) from the engine thread
+        response_receiver: Receiver<ChessMove>,
+        // Flag to indicate that a move is currently being computed
+        has_pending: bool,
+    }
+
+    impl UciEngine {
+        /// Starts a new UCI engine process.
+        ///
+        /// # Arguments
+        /// * `path` – Path to the UCI engine executable.
+        /// * `move_time_ms` – Time in milliseconds allocated per move.
+        ///
+        /// # Errors
+        /// Returns an error string if the engine fails to start or does not respond to `uci` command.
+        pub fn new(path: &str, move_time_ms: u64) -> Result<Self, String> {
+            let mut child = Command::new(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("Failed to spawn engine: {}", e))?;
+
+            let mut stdin = child.stdin.take().expect("failed to open stdin");
+            let stdout = child.stdout.take().expect("failed to open stdout");
+            let mut reader = BufReader::new(stdout);
+
+            // Send UCI handshake
+            stdin
+                .write_all(b"uci\n")
+                .and_then(|_| stdin.flush())
+                .map_err(|e| format!("Failed to write to engine: {}", e))?;
+
+            // Wait for "uciok" to confirm engine is ready
+            let mut line = String::new();
+            let mut ready = false;
+            while let Ok(n) = reader.read_line(&mut line) {
+                if n == 0 {
+                    break;
+                }
+                if line.trim() == "uciok" {
+                    ready = true;
+                    break;
+                }
+                line.clear();
+            }
+            if !ready {
+                let _ = child.kill();
+                return Err("Engine did not respond with 'uciok'".to_string());
+            }
+
+            // Create channels for communication
+            let (req_tx, req_rx) = mpsc::channel();
+            let (res_tx, res_rx) = mpsc::channel();
+
+            // Spawn the engine thread
+            thread::spawn(move || {
+                engine_thread_loop(child, stdin, reader, req_rx, res_tx, move_time_ms);
+            });
+
+            Ok(UciEngine {
+                request_sender: req_tx,
+                response_receiver: res_rx,
+                has_pending: false,
+            })
+        }
+
+        /// Request the engine to compute a move for the given FEN position.
+        /// This is non‑blocking; the result will be available via `try_take_move()`.
+        pub fn request_move(&mut self, fen: String) {
+            if !self.has_pending {
+                // Send the FEN to the engine thread
+                let _ = self.request_sender.send(fen);
+                self.has_pending = true;
+            }
+        }
+
+        /// Checks if a move has been produced by the engine.
+        /// If yes, returns the move and clears the pending flag.
+        pub fn try_take_move(&mut self) -> Option<ChessMove> {
+            if let Ok(m) = self.response_receiver.try_recv() {
+                self.has_pending = false;
+                Some(m)
+            } else {
+                None
+            }
+        }
+
+        /// Returns `true` if a move is currently being computed.
+        pub fn has_pending_move(&self) -> bool {
+            self.has_pending
+        }
+
+        /// Reset the engine's state (e.g., for a new game).
+        /// Currently does nothing; could send `ucinewgame` if needed.
+        pub fn reset(&mut self) {
+            // Optional: send "ucinewgame" to engine.
+            // For simplicity we ignore.
+            self.has_pending = false;
+        }
+    }
+
+    /// The main loop running in the engine thread.
+    fn engine_thread_loop(
+        mut child: Child,
+        mut stdin: std::process::ChildStdin,
+        mut reader: BufReader<std::process::ChildStdout>,
+        request_rx: Receiver<String>,
+        response_tx: Sender<ChessMove>,
+        move_time_ms: u64,
+    ) {
+        // We'll read engine output asynchronously in a loop.
+        // We need to watch for "bestmove" lines and also handle requests.
+        // This simplified version uses blocking reads; we will use a separate thread
+        // to read engine output, or we can do non-blocking I/O. Since we are in a
+        // dedicated thread, we can block on reads.
+
+        // We'll spawn a reader thread that continuously reads lines and forwards
+        // any "bestmove" to the response channel.
+        let (line_tx, line_rx) = mpsc::channel();
+        let reader_handle = thread::spawn(move || {
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line) {
+                if n == 0 {
+                    break; // EOF
+                }
+                if let Some(bestmove) = parse_bestmove(&line) {
+                    let _ = line_tx.send(bestmove);
+                }
+                line.clear();
+            }
+        });
+
+        // Main loop: wait for request, send position + go, then wait for bestmove.
+        // We'll use a loop that checks for new requests and also listens for engine output.
+        // Since we have a separate reader thread, we can just wait for a request,
+        // then send commands, and then wait for the response via line_rx.
+        // We'll also need to handle engine termination.
+
+        loop {
+            // Wait for a request (blocking).
+            let fen = match request_rx.recv() {
+                Ok(f) => f,
+                Err(_) => break, // sender dropped -> exit
+            };
+
+            // Send position and go commands.
+            let cmd = format!("position fen {}\ngo movetime {}\n", fen, move_time_ms);
+            if let Err(e) = stdin.write_all(cmd.as_bytes()).and_then(|_| stdin.flush()) {
+                eprintln!("Error writing to engine: {}", e);
+                break;
+            }
+
+            // Wait for the response (bestmove) from the reader thread.
+            // We'll use a timeout to avoid hanging if engine fails.
+            // Using recv_timeout is not stable in std; we can use recv() with a loop
+            // and check for engine process termination.
+            match line_rx.recv() {
+                Ok(m) => {
+                    let _ = response_tx.send(m);
+                }
+                Err(_) => break, // reader thread died
+            }
+        }
+
+        // Clean up
+        let _ = child.kill();
+        let _ = reader_handle.join();
+    }
+
+    /// Parses a line of engine output to extract a `bestmove` command.
+    /// Returns `Some(ChessMove)` if the line contains a valid bestmove.
+    fn parse_bestmove(line: &str) -> Option<ChessMove> {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("bestmove") {
+            return None;
+        }
+        // Format: "bestmove e2e4" or "bestmove e2e4 ponder ..."
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let move_str = parts[1];
+        // Convert UCI move string to ChessMove
+        // UCI format: e2e4, e7e8q (promotion)
+        let bytes = move_str.as_bytes();
+        if bytes.len() < 4 {
+            return None;
+        }
+        let from_file = (bytes[0] - b'a') as u32;
+        let from_rank = (bytes[1] - b'1') as u32;
+        let to_file = (bytes[2] - b'a') as u32;
+        let to_rank = (bytes[3] - b'1') as u32;
+        let from_sq = super::get_square(from_file, from_rank);
+        let to_sq = super::get_square(to_file, to_rank);
+        let promotion = if bytes.len() >= 5 {
+            match bytes[4] {
+                b'q' => Some(ChessPiece::Queen),
+                b'r' => Some(ChessPiece::Rook),
+                b'b' => Some(ChessPiece::Bishop),
+                b'n' => Some(ChessPiece::Knight),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Some(ChessMove::new(from_sq, to_sq, promotion))
+    }
+}
+
+// Re-export UciEngine if feature enabled
+#[cfg(feature = "uci")]
+pub use uci::UciEngine;
