@@ -1,21 +1,77 @@
 //! # chess-render
 //!
-//! A configurable, embeddable chess GUI built with Macroquad.
+//! A configurable, embeddable chess GUI built with [Macroquad](https://macroquad.rs/).
+//!
+//! This crate provides a ready‑to‑use chess board widget that handles:
+//! - Rendering the board and pieces from a texture atlas.
+//! - Valid move generation and enforcement via the [`chess`](https://crates.io/crates/chess) crate.
+//! - Two‑player local play with automatic board flip after each move.
+//! - Optional UCI engine integration (behind the `uci` feature flag).
+//! - Endgame detection (checkmate, stalemate) and a restart button.
+//!
+//! ## Quick Start
+//!
+//! The typical usage is to create a [`ChessGui`] instance inside a Macroquad application,
+//! load the piece textures with [`load_pieces`](ChessGui::load_pieces), and then call
+//! [`update`](ChessGui::update) every frame.
+//!
+//! ```no_run
+//! use chess_render::{ChessGui, ChessConfig};
+//!
+//! #[macroquad::main("Chess")]
+//! async fn main() {
+//!     let config = ChessConfig::default();
+//!     let mut gui = ChessGui::new(config);
+//!     gui.load_pieces().await;
+//!
+//!     loop {
+//!         gui.update().await;
+//!         next_frame().await;
+//!     }
+//! }
+//! ```
 //!
 //! ## Features
-//! - Valid move enforcement via the `chess` crate
-//! - Two-player local play with automatic board flip
-//! - Optional UCI engine integration (enable `uci` feature)
-//! - Fully customizable colors and piece sprites
-//! - Endgame detection (checkmate, stalemate)
+//!
+//! - **`uci`** – enables UCI engine support. When this feature is active, you can set
+//!   [`uci_engine_path`](ChessConfig::uci_engine_path) to play against a UCI‑compatible engine.
+//!   The engine will move as Black (this is a placeholder implementation that only plays the first
+//!   legal move; a full engine integration is left as an exercise for the user).
 //!
 //! ## Piece Texture Specification
-//! The piece texture must be a PNG of size 384x128 pixels.
-//! It contains 6 white pieces and 6 black pieces, each 64x64 pixels.
 //!
-//! Layout:
-//! - Row 0 (y=0): White Pieces (Left to Right: King, Queen, Bishop, Knight, Rook, Pawn)
-//! - Row 1 (y=64): Black Pieces (Left to Right: King, Queen, Bishop, Knight, Rook, Pawn)
+//! The piece texture must be a PNG of exactly **384×128** pixels.
+//! It contains 6 white pieces and 6 black pieces, each 64×64 pixels.
+//!
+//! ### Layout
+//!
+//! | Row        | X=0     | X=64    | X=128   | X=192   | X=256   | X=320   |
+//! |------------|---------|---------|---------|---------|---------|---------|
+//! | **y=0**    | White King | White Queen | White Bishop | White Knight | White Rook | White Pawn |
+//! | **y=64**   | Black King | Black Queen | Black Bishop | Black Knight | Black Rook | Black Pawn |
+//!
+//! If a custom path is not provided (or fails to load), the crate falls back to a built‑in
+//! default texture embedded in the binary.
+//!
+//! ## Coordinate System
+//!
+//! The board is drawn as an 8×8 grid where each square is 64×64 pixels.
+//! The board is always aligned to the top‑left corner of the window (0,0) and is 512×512 pixels.
+//! The perspective can be flipped so that the current player’s side is at the bottom.
+//!
+//! ## Game Flow
+//!
+//! 1. The game starts with a standard starting position.
+//! 2. Players take turns by clicking and dragging pieces.
+//! 3. Legal moves are enforced; pawn promotion is automatically done to a Queen.
+//! 4. After each move, the board flips to show the opponent’s perspective.
+//! 5. When checkmate or stalemate occurs, an overlay message is shown and the user can press `R` to restart.
+//! 6. If the `uci` feature is enabled and an engine path is set, the engine moves as Black.
+//!
+//! ## Customisation
+//!
+//! Use [`ChessConfig`] to change the square colours and optionally provide a custom piece sheet.
+//! You can also enable UCI engine play.
 
 use chess::{
     Board, ChessMove, Color as ChessColor, File, MoveGen, Piece as ChessPiece, Rank, Square,
@@ -27,14 +83,26 @@ use macroquad::prelude::*;
 const DEFAULT_PIECES_PNG: &[u8] = include_bytes!("assets/pieces.png");
 
 /// Custom game result enum since the `chess` crate doesn't provide one directly.
+///
+/// This represents the outcome of a finished game:
+/// - `WhiteWins` – White checkmated Black.
+/// - `BlackWins` – Black checkmated White.
+/// - `Draw` – Stalemate (or, in future, other draw conditions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameResult {
+    /// White has won by checkmate.
     WhiteWins,
+    /// Black has won by checkmate.
     BlackWins,
+    /// The game ended in a draw (currently only stalemate is detected).
     Draw,
 }
 
 /// Helper to convert 0-7 file/rank indices to `chess::Square`.
+///
+/// # Panics
+/// This function uses `unreachable!()` if the input is outside 0..7.
+/// It is only called with valid indices from board iteration, so it is safe.
 fn get_square(file: u32, rank: u32) -> Square {
     let f = match file {
         0 => File::A,
@@ -62,6 +130,10 @@ fn get_square(file: u32, rank: u32) -> Square {
 }
 
 /// Checks the board state to determine if the game has ended.
+///
+/// Returns `Some(GameResult)` if the side to move has no legal moves:
+/// - If the king is in check → checkmate (winner is the other side).
+/// - If the king is not in check → stalemate (draw).
 fn check_game_result(board: &Board) -> Option<GameResult> {
     let mut move_gen = MoveGen::new_legal(board);
     if move_gen.next().is_none() {
@@ -78,17 +150,21 @@ fn check_game_result(board: &Board) -> Option<GameResult> {
     }
 }
 
-/// Configuration for the chess GUI appearance.
+/// Configuration for the chess GUI appearance and behaviour.
+///
+/// Use the builder‑style or direct field assignment to customise the look and optional
+/// engine path. All fields have sensible defaults.
 #[derive(Debug, Clone)]
 pub struct ChessConfig {
-    /// Light square color. Default: OFFWHITE
+    /// Colour of the light squares. Default is an off‑white (`#fffdcc`).
     pub light_square_color: Color,
-    /// Dark square color. Default: GRAY
+    /// Colour of the dark squares. Default is `GRAY`.
     pub dark_square_color: Color,
-    /// Path to the piece texture sheet (384x128 px).
-    /// If `None`, the built-in default pieces will be used.
+    /// Optional path to a custom piece texture sheet (PNG, 384×128).
+    /// If `None`, the built‑in default pieces are used.
     pub piece_texture_path: Option<String>,
     /// If set, plays against a UCI engine at this path as Black.
+    /// This field is only available when the `uci` feature is enabled.
     #[cfg(feature = "uci")]
     pub uci_engine_path: Option<String>,
 }
@@ -106,6 +182,9 @@ impl Default for ChessConfig {
 }
 
 /// Internal representation of a piece for rendering mapping.
+///
+/// This enum maps each chess piece + colour combination to a unique variant.
+/// It provides the source rectangle coordinates inside the 384×128 texture atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderPiece {
     WhiteKing,
@@ -123,6 +202,7 @@ enum RenderPiece {
 }
 
 impl RenderPiece {
+    /// Converts a `chess::Piece` and `chess::Color` into a `RenderPiece`.
     fn from_chess(piece: ChessPiece, color: ChessColor) -> Self {
         match (color, piece) {
             (ChessColor::White, ChessPiece::King) => RenderPiece::WhiteKing,
@@ -140,7 +220,7 @@ impl RenderPiece {
         }
     }
 
-    /// Returns the source rectangle in the 384x128 texture atlas.
+    /// Returns the `(x, y)` top‑left corner of the 64×64 sprite in the texture atlas.
     fn tex_coords(&self) -> (f32, f32) {
         match self {
             RenderPiece::WhiteKing => (0.0, 0.0),
@@ -160,18 +240,42 @@ impl RenderPiece {
 }
 
 /// The main Chess GUI struct.
+///
+/// Holds the current board state, configuration, loaded texture, interaction state,
+/// and game result. You create one instance and call [`update`](ChessGui::update)
+/// in your game loop.
 pub struct ChessGui {
+    /// The current chess board (from the `chess` crate).
     board: Board,
+    /// Configuration for appearance and optional engine.
     config: ChessConfig,
+    /// Loaded piece texture (optional until loaded).
     pieces_texture: Option<Texture2D>,
+    /// The square that is currently selected (clicked) by the user.
     selected_square: Option<Square>,
+    /// If a piece is being dragged, stores the source square and the offset
+    /// from the mouse click to the top‑left of the square.
     dragging_piece: Option<(Square, f32, f32)>,
+    /// Which side is shown at the bottom of the board (White or Black).
     perspective: ChessColor,
+    /// The result of the game, if it has ended.
     game_result: Option<GameResult>,
+    /// A status message (e.g., "White Wins!", "Game Drawn").
     status_message: String,
 }
 
 impl ChessGui {
+    /// Creates a new chess GUI with the given configuration.
+    ///
+    /// The board is initialised to the standard starting position.
+    /// The piece texture is not loaded yet – you must call [`load_pieces`](ChessGui::load_pieces)
+    /// before rendering.
+    ///
+    /// # Example
+    /// ```
+    /// let config = ChessConfig::default();
+    /// let gui = ChessGui::new(config);
+    /// ```
     pub fn new(config: ChessConfig) -> Self {
         Self {
             board: Board::default(),
@@ -185,8 +289,23 @@ impl ChessGui {
         }
     }
 
-    /// Loads the piece textures. Uses the built-in default if no custom path is provided,
-    /// or if the custom path fails to load.
+    /// Loads the piece textures from the configured path or falls back to the built‑in default.
+    ///
+    /// This method should be called once before the main loop, or at least before the first
+    /// call to [`update`](ChessGui::update). It reads the file asynchronously (using `std::fs`
+    /// in a blocking manner – see note below).
+    ///
+    /// # Blocking I/O
+    ///
+    /// This method uses synchronous `std::fs::read`, which may block the async executor.
+    /// In a real application you might want to load textures asynchronously; this is a
+    /// simplification suitable for most Macroquad games.
+    ///
+    /// # Errors
+    ///
+    /// If the custom path fails to load, an error is printed to stderr and the default
+    /// texture is used instead. If the loaded image does not have the expected dimensions
+    /// (384×128), a warning is printed, but the texture is still used.
     pub async fn load_pieces(&mut self) {
         let image_data = if let Some(ref path) = self.config.piece_texture_path {
             match std::fs::read(path) {
@@ -216,6 +335,24 @@ impl ChessGui {
         }
     }
 
+    /// Updates the GUI: draws the board, handles user input, and processes engine moves.
+    ///
+    /// This method must be called once per frame in your game loop. It assumes that
+    /// the Macroquad context is active and that the window is at least 512×512 pixels.
+    /// It clears the background with the light square colour, draws the board and pieces,
+    /// and processes mouse events.
+    ///
+    /// # Game Flow
+    ///
+    /// - If the game is not over, the user can interact with pieces via click‑and‑drag.
+    /// - If the `uci` feature is enabled and an engine path is set, the engine moves
+    ///   as Black automatically after each human move (it plays the first legal move found).
+    /// - When the game ends, an overlay message is shown and pressing the `R` key restarts.
+    ///
+    /// # Panics
+    ///
+    /// This method may panic if the piece texture is not loaded before calling it;
+    /// however it will display an error text instead of crashing.
     pub async fn update(&mut self) {
         // Check for game end
         if self.game_result.is_none() {
@@ -272,6 +409,10 @@ impl ChessGui {
         }
     }
 
+    /// Resets the game to the initial position.
+    ///
+    /// Clears the board, selected square, dragging state, sets perspective to White,
+    /// and clears the game result and status message.
     fn restart(&mut self) {
         self.board = Board::default();
         self.selected_square = None;
@@ -281,6 +422,11 @@ impl ChessGui {
         self.status_message.clear();
     }
 
+    /// Draws the board, pieces, and any dragged piece.
+    ///
+    /// This method is called by [`update`](ChessGui::update) and assumes the texture is loaded.
+    /// It draws all 64 squares, then pieces (except the one being dragged), and finally
+    /// the dragged piece on top.
     fn draw_board(&self) {
         let Some(texture) = &self.pieces_texture else {
             draw_text("Load pieces texture first!", 100.0, 256.0, 20.0, RED);
@@ -355,6 +501,15 @@ impl ChessGui {
         }
     }
 
+    /// Processes mouse input for piece selection, dragging, and move execution.
+    ///
+    /// This method is called only when the game is not over. It handles:
+    /// - Left mouse button press: select a piece if it belongs to the side to move.
+    /// - Mouse movement while dragging: updates the dragged piece position (handled by the render loop).
+    /// - Left mouse button release: attempt to move the selected piece to the target square.
+    ///
+    /// If the move is legal, it is executed, the board is updated, perspective is flipped,
+    /// and the game result is re‑evaluated in the next call to [`update`](ChessGui::update).
     fn handle_input(&mut self) {
         let (mx, my) = mouse_position();
 
