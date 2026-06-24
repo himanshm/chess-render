@@ -7,7 +7,7 @@ license = "MIT"
 authors = ["Himansh Mewada <himanshmewada06@atomicmail.io>"]
 repository = "https://github.com/himanshm/chess-render"
 readme = "README.md"
-keywords = ["chess", "gui", "uci", "board", "render", "chess-render"]
+keywords = ["chess", "gui", "uci", "board", "render"]
 categories = ["game-engines", "gui"]
 
 [dependencies]
