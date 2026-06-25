@@ -1,0 +1,15 @@
+   Compiling chess-render v0.2.2 (/home/himanshm/Projects/chess-render)
+warning: field `promotion_choices` is never read
+   --> src/lib.rs:260:5
+    |
+245 | pub struct ChessGui {
+    |            -------- field in this struct
+...
+260 |     promotion_choices: Vec<ChessPiece>,  // always [Queen, Rook, Bishop, Knight]
+    |     ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `chess-render` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 2.93s
+     Running `target/release/examples/demo`
