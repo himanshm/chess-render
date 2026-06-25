@@ -3,6 +3,7 @@ use macroquad::prelude::*;
 
 #[macroquad::main("Chess Render")]
 async fn main() {
+    env_logger::init();
     // Use default config, but you can set the engine path here
     let config = ChessConfig::default();
 
@@ -12,7 +13,7 @@ async fn main() {
     // config.uci_move_time_ms = 500; // half a second per move
 
     let mut gui = ChessGui::new(config);
-    gui.load_pieces().await;
+    let _ = gui.load_pieces().await;
 
     loop {
         gui.update().await;
