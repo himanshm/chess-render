@@ -3,13 +3,15 @@
 //! A configurable, embeddable chess GUI built with [Macroquad](https://macroquad.rs/).
 //!
 //! This crate provides a ready‑to‑use chess board widget that handles:
-//! - Rendering the board and pieces from a texture atlas.
+//!
+//! - Rendering the board and pieces from a texture atlas (with a built‑in default texture).
 //! - Valid move generation and enforcement via the [`chess`](https://crates.io/crates/chess) crate.
 //! - Two‑player local play with automatic board flip after each move (optional).
-//! - Optional UCI engine integration (behind the `uci` feature flag) – now with proper asynchronous
+//! - Optional UCI engine integration (behind the `uci` feature flag) with proper asynchronous
 //!   communication via a background thread.
 //! - Endgame detection (checkmate, stalemate) and a restart button.
 //! - Automatic centering of the board in the window (configurable).
+//! - Usability features: turn indicator, last‑move highlighting, promotion pop‑up, and a “New Game” button.
 //!
 //! ## Quick Start
 //!
@@ -37,7 +39,8 @@
 //!
 //! - **`uci`** – enables UCI engine support. When this feature is active, you can set
 //!   [`uci_engine_path`](ChessConfig::uci_engine_path) to play against a UCI‑compatible engine.
-//!   The engine moves as Black (configurable via `uci_plays_as`).
+//!   The engine moves as the side specified by [`uci_plays_as`](ChessConfig::uci_plays_as)
+//!   (default: Black). See the [`UciEngine`] documentation for more details.
 //!
 //! ## Piece Texture Specification
 //!
@@ -61,6 +64,12 @@
 //! offset if `center_board` is set to `false`. The perspective can be flipped so that the
 //! current player’s side is at the bottom.
 //!
+//! ## Sharpness Tip
+//!
+//! For the crispest piece rendering, set `square_size` to an integer multiple of 64
+//! (e.g., 64, 128, 192, …). The renderer rounds the size to the nearest integer to
+//! avoid sub‑pixel blurring, but exact multiples give the best results.
+//!
 //! ## Game Flow
 //!
 //! 1. The game starts with a standard starting position.
@@ -82,15 +91,18 @@ use macroquad::prelude::*;
 // Embed the default piece texture directly into the binary.
 const DEFAULT_PIECES_PNG: &[u8] = include_bytes!("assets/pieces.png");
 
-/// Custom game result enum that covers all end‑game states.
+/// The result of a finished chess game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameResult {
+    /// White delivered checkmate.
     WhiteWins,
+    /// Black delivered checkmate.
     BlackWins,
+    /// Game ended in stalemate (draw).
     Draw,
 }
 
-/// Helper to convert 0-7 file/rank indices to `chess::Square`.
+/// Helper to convert 0-7 file/rank indices to a [`chess::Square`].
 /// Returns `None` if the indices are out of range.
 pub(crate) fn get_square(file: u32, rank: u32) -> Option<Square> {
     let f = match file {
@@ -118,8 +130,8 @@ pub(crate) fn get_square(file: u32, rank: u32) -> Option<Square> {
     Some(Square::make_square(r, f))
 }
 
-/// Checks the board state for checkmate or stalemate using `Board::status()`.
-/// Returns `Some(GameResult)` if the game has ended.
+/// Checks the board state for checkmate or stalemate.
+/// Returns `Some(GameResult)` if the game has ended, otherwise `None`.
 fn check_game_result(board: &Board) -> Option<GameResult> {
     match board.status() {
         BoardStatus::Checkmate => {
@@ -135,6 +147,20 @@ fn check_game_result(board: &Board) -> Option<GameResult> {
 }
 
 /// Configuration for the chess GUI appearance and behaviour.
+///
+/// All fields have sensible defaults; you can override only what you need.
+///
+/// # Example
+///
+/// ```
+/// # use chess_render::ChessConfig;
+/// let config = ChessConfig {
+///     square_size: 80.0,
+///     center_board: true,
+///     promotion_piece: chess::Piece::Queen,
+///     ..ChessConfig::default()
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct ChessConfig {
     /// Colour of the light squares. Default: off‑white (`#fffdcc`).
@@ -143,20 +169,24 @@ pub struct ChessConfig {
     pub dark_square_color: Color,
     /// Size of each square in pixels. Default: 64.
     pub square_size: f32,
-    /// Offset of the board from the top‑left corner of the window. Only used when `center_board` is `false`.
-    /// Default: (0.0, 0.0).
+    /// Offset of the board from the top‑left corner of the window.
+    /// Only used when `center_board` is `false`. Default: (0.0, 0.0).
     pub board_offset: (f32, f32),
-    /// If `true`, the board is automatically centered in the window (ignoring `board_offset`). Default: `true`.
+    /// If `true`, the board is automatically centered in the window.
+    /// When enabled, `board_offset` is ignored. Default: `true`.
     pub center_board: bool,
-    /// Whether to automatically flip the board perspective after each move. Default: true.
+    /// Whether to automatically flip the board perspective after each move.
+    /// Default: `true`.
     pub auto_flip_perspective: bool,
-    /// The piece to promote to when a pawn reaches the last rank. Default: Queen.
-    /// **Note:** This is now used as the *default* promotion piece; the user can still choose a different one via the pop‑up.
+    /// The piece to promote to when a pawn reaches the last rank.
+    /// This is the **default** choice; the user may select a different piece
+    /// via the pop‑up dialog. Default: [`ChessPiece::Queen`].
     pub promotion_piece: ChessPiece,
     /// Optional path to a custom piece texture sheet (PNG, 384×128).
     /// If `None`, the built‑in default pieces are used.
     pub piece_texture_path: Option<String>,
     /// If set, plays against a UCI engine at this path.
+    /// This field is only available when the `uci` feature is enabled.
     #[cfg(feature = "uci")]
     pub uci_engine_path: Option<String>,
     /// Which side the UCI engine should play. Default: `ChessColor::Black`.
@@ -242,6 +272,32 @@ impl RenderPiece {
 }
 
 /// The main Chess GUI struct.
+///
+/// Manages the game state, rendering, input handling, and optional UCI engine communication.
+///
+/// # Usage
+///
+/// 1. Create an instance with [`new`](ChessGui::new) and a [`ChessConfig`].
+/// 2. Call [`load_pieces`](ChessGui::load_pieces) asynchronously to load the texture.
+/// 3. In your game loop, call [`update`](ChessGui::update) every frame.
+///
+/// # Example
+///
+/// ```no_run
+/// use chess_render::{ChessGui, ChessConfig};
+///
+/// #[macroquad::main("Chess")]
+/// async fn main() {
+///     let config = ChessConfig::default();
+///     let mut gui = ChessGui::new(config);
+///     gui.load_pieces().await;
+///
+///     loop {
+///         gui.update().await;
+///         next_frame().await;
+///     }
+/// }
+/// ```
 pub struct ChessGui {
     board: Board,
     config: ChessConfig,
@@ -251,19 +307,18 @@ pub struct ChessGui {
     perspective: ChessColor,
     game_result: Option<GameResult>,
     status_message: String,
-    // Cached rectangles for piece sprites
     piece_rects: std::collections::HashMap<RenderPiece, Rect>,
 
-    // ---------- Usability enhancements ----------
-    last_move: Option<(Square, Square)>, // last move source & destination
-    pending_promotion: Option<ChessMove>, // move awaiting promotion choice
-    promotion_choices: Vec<ChessPiece>,  // always [Queen, Rook, Bishop, Knight]
-    // --------------------------------------------
+    last_move: Option<(Square, Square)>,
+    pending_promotion: Option<ChessMove>,
+    promotion_choices: Vec<ChessPiece>,
+
     #[cfg(feature = "uci")]
     uci_engine: Option<uci::UciEngine>,
 }
 
 impl ChessGui {
+    /// Creates a new chess GUI with the given configuration.
     pub fn new(config: ChessConfig) -> Self {
         Self {
             board: Board::default(),
@@ -300,7 +355,7 @@ impl ChessGui {
         }
     }
 
-    /// Asynchronously loads the piece texture from the configured path or falls back to the default.
+    /// Asynchronously loads the piece texture.
     pub async fn load_pieces(&mut self) {
         let image_data = if let Some(ref path) = self.config.piece_texture_path {
             match load_file(path).await {
@@ -378,7 +433,6 @@ impl ChessGui {
 
     /// Updates the GUI: draws the board, handles input, and processes engine moves.
     pub async fn update(&mut self) {
-        // Check game result (only if not already ended and not waiting for promotion)
         if self.pending_promotion.is_none() && self.game_result.is_none() {
             self.game_result = check_game_result(&self.board);
             if let Some(result) = &self.game_result {
@@ -393,11 +447,10 @@ impl ChessGui {
         clear_background(Color::new(180. / 255., 220. / 255., 255. / 255., 1.));
         self.draw_board();
 
-        // Handle promotion pop‑up if active
         if self.pending_promotion.is_some() {
             self.draw_promotion_dialog();
             self.handle_promotion_input();
-            return; // skip further input and engine moves while promoting
+            return;
         }
 
         if self.game_result.is_none() {
@@ -421,9 +474,6 @@ impl ChessGui {
                     }
                 }
             }
-        } else {
-            // End game overlay – drawn by draw_board already, but we also show a restart button
-            // The "New Game" button is drawn every frame, so it will be visible.
         }
     }
 
@@ -435,7 +485,8 @@ impl ChessGui {
             return;
         };
 
-        let size = self.config.square_size;
+        // Round the square size to the nearest integer to avoid sub‑pixel blur.
+        let size = self.config.square_size.round();
         let (ox, oy) = self.get_board_offset();
         let board_pixels = size * 8.0;
 
@@ -470,7 +521,7 @@ impl ChessGui {
                             screen_y,
                             size,
                             size,
-                            Color::new(1.0, 0.8, 0.0, 0.3), // golden
+                            Color::new(1.0, 0.8, 0.0, 0.3),
                         );
                     }
                 }
@@ -543,25 +594,11 @@ impl ChessGui {
             let file_label = (b'a' + i as u8) as char;
             let rank_label = (b'1' + i as u8) as char;
 
-            // File labels (bottom) – use background color of the square below
-            let file_sq = if self.perspective == ChessColor::White {
-                get_square(i as u32, 0).unwrap()
+            // File labels (bottom)
+            let file_sq_color = if (i + 0) % 2 == 0 {
+                self.config.light_square_color
             } else {
-                get_square(7 - i as u32, 7).unwrap()
-            };
-            let file_sq_color = if self.board.piece_on(file_sq).is_some() {
-                // fallback to square color
-                if (i + 0) % 2 == 0 {
-                    self.config.light_square_color
-                } else {
-                    self.config.dark_square_color
-                }
-            } else {
-                if (i + 0) % 2 == 0 {
-                    self.config.light_square_color
-                } else {
-                    self.config.dark_square_color
-                }
+                self.config.dark_square_color
             };
             let file_text_color = contrast_color(file_sq_color);
 
@@ -580,7 +617,6 @@ impl ChessGui {
             );
 
             // Rank labels (left)
-            // FIX: removed unused variable 'rank_sq'
             let rank_sq_color = if (0 + i) % 2 == 0 {
                 self.config.light_square_color
             } else {
@@ -646,37 +682,35 @@ impl ChessGui {
         draw_text(
             &turn_text,
             ox + board_pixels / 2.0 - text_size.width / 2.0,
-            oy + board_pixels + 35.0,
+            oy + board_pixels + 45.0, // increased spacing
             24.0,
             BLACK,
         );
 
-        // ---------- "New Game" button (bottom‑right of the board) ----------
-        let btn_w = 120.0;
-        let btn_h = 30.0;
-        let btn_x = ox + board_pixels - btn_w - 10.0;
-        let btn_y = oy + board_pixels + 10.0;
+        // ---------- "New Game" button (right side of the board, centered vertically) ----------
+        let btn_w = 100.0;
+        let btn_h = 28.0;
+        let btn_x = ox + board_pixels + 15.0;
+        let btn_y = oy + board_pixels / 2.0 - btn_h / 2.0;
         draw_rectangle(btn_x, btn_y, btn_w, btn_h, DARKGRAY);
         draw_rectangle_lines(btn_x, btn_y, btn_w, btn_h, 1.0, BLACK);
         let btn_text = "New Game";
-        let btn_text_size = measure_text(btn_text, None, 18, 1.0);
+        let btn_text_size = measure_text(btn_text, None, 16, 1.0);
         draw_text(
             btn_text,
             btn_x + (btn_w - btn_text_size.width) / 2.0,
             btn_y + (btn_h + btn_text_size.height) / 2.0 - 2.0,
-            18.0,
+            16.0,
             WHITE,
         );
-        // Store button bounds for input handling (we'll check in handle_input)
-        // We'll just use global coordinates; we'll check in input handler.
+        // We'll store button bounds in input handler (global coordinates).
     }
 
     fn draw_promotion_dialog(&self) {
-        let size = self.config.square_size;
+        let size = self.config.square_size.round();
         let (ox, oy) = self.get_board_offset();
         let board_pixels = size * 8.0;
 
-        // Semi‑transparent overlay
         draw_rectangle(
             ox,
             oy,
@@ -685,7 +719,6 @@ impl ChessGui {
             Color::new(0., 0., 0., 0.7),
         );
 
-        // Four piece choices (Queen, Rook, Bishop, Knight)
         let choice_size = size * 0.8;
         let gap = size * 0.3;
         let total_width = choice_size * 4.0 + gap * 3.0;
@@ -699,7 +732,7 @@ impl ChessGui {
             ChessPiece::Knight,
         ];
 
-        let color = self.board.side_to_move(); // the side that is promoting
+        let color = self.board.side_to_move();
 
         for (i, &piece) in promotion_pieces.iter().enumerate() {
             let x = start_x + i as f32 * (choice_size + gap);
@@ -707,7 +740,6 @@ impl ChessGui {
             draw_rectangle(x, y, choice_size, choice_size, DARKGRAY);
             draw_rectangle_lines(x, y, choice_size, choice_size, 2.0, WHITE);
 
-            // Draw the piece image
             let render_piece = RenderPiece::from_chess(piece, color);
             if let Some(rect) = self.piece_rects.get(&render_piece) {
                 if let Some(texture) = &self.pieces_texture {
@@ -729,7 +761,6 @@ impl ChessGui {
             }
         }
 
-        // Label
         let label = "Choose promotion piece";
         let label_size = measure_text(label, None, 20, 1.0);
         draw_text(
@@ -745,15 +776,15 @@ impl ChessGui {
 
     fn handle_input(&mut self) {
         let (mx, my) = mouse_position();
-        let size = self.config.square_size;
+        let size = self.config.square_size.round();
         let (ox, oy) = self.get_board_offset();
         let board_pixels = size * 8.0;
 
-        // Check "New Game" button click (bottom‑right)
-        let btn_w = 120.0;
-        let btn_h = 30.0;
-        let btn_x = ox + board_pixels - btn_w - 10.0;
-        let btn_y = oy + board_pixels + 10.0;
+        // Check "New Game" button click (right side)
+        let btn_w = 100.0;
+        let btn_h = 28.0;
+        let btn_x = ox + board_pixels + 15.0;
+        let btn_y = oy + board_pixels / 2.0 - btn_h / 2.0;
         if is_mouse_button_pressed(MouseButton::Left)
             && mx >= btn_x
             && mx <= btn_x + btn_w
@@ -764,12 +795,10 @@ impl ChessGui {
             return;
         }
 
-        // If game over, ignore other input (except button above)
         if self.game_result.is_some() {
             return;
         }
 
-        // Handle board clicks
         let file = ((mx - ox) / size) as i32;
         let rank = ((my - oy) / size) as i32;
 
@@ -822,7 +851,6 @@ impl ChessGui {
         } else if is_mouse_button_released(MouseButton::Left) {
             if let Some(from_sq) = self.selected_square {
                 if from_sq != sq {
-                    // Check if this move is a pawn promotion
                     let is_pawn = self.board.piece_on(from_sq) == Some(ChessPiece::Pawn);
                     let promo_rank = if self.board.side_to_move() == ChessColor::White {
                         7
@@ -832,8 +860,6 @@ impl ChessGui {
                     let is_promotion = is_pawn && logical_rank == promo_rank;
 
                     if is_promotion {
-                        // Create the move with a placeholder promotion (e.g., Queen) – we'll use the config default
-                        // But we store the move and set pending_promotion
                         let move_candidate =
                             ChessMove::new(from_sq, sq, Some(self.config.promotion_piece));
                         if self.board.legal(move_candidate) {
@@ -855,10 +881,8 @@ impl ChessGui {
         }
     }
 
-    // FIX: changed &self to &mut self
     fn handle_promotion_input(&mut self) {
-        // Promotion pop‑up: click on one of the four piece icons
-        let size = self.config.square_size;
+        let size = self.config.square_size.round();
         let (ox, oy) = self.get_board_offset();
         let board_pixels = size * 8.0;
 
@@ -881,8 +905,6 @@ impl ChessGui {
                 let x = start_x + i as f32 * (choice_size + gap);
                 let y = start_y;
                 if mx >= x && mx <= x + choice_size && my >= y && my <= y + choice_size {
-                    // User selected this piece
-                    // FIX: removed 'mut' from move_candidate (not needed)
                     if let Some(move_candidate) = self.pending_promotion.take() {
                         let new_move = ChessMove::new(
                             move_candidate.get_source(),
@@ -914,10 +936,9 @@ impl ChessGui {
         }
     }
 
-    /// Attempts to make a move. Returns `true` if legal and applied.
+    /// Attempts to make a move on the board.
     pub fn try_move(&mut self, m: ChessMove) -> bool {
         if self.board.legal(m) {
-            // Record last move
             self.last_move = Some((m.get_source(), m.get_dest()));
             self.board = self.board.make_move_new(m);
             if self.config.auto_flip_perspective {
@@ -1012,6 +1033,7 @@ mod uci {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// A handle to a UCI chess engine running as a background process.
     pub struct UciEngine {
         child: Child,
         stdin: std::process::ChildStdin,
@@ -1024,6 +1046,7 @@ mod uci {
     }
 
     impl UciEngine {
+        /// Creates a new UCI engine instance.
         pub fn new(path: &str, move_time_ms: u64) -> Result<Self, String> {
             let mut child = Command::new(path)
                 .stdin(Stdio::piped())
