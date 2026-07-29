@@ -1,13 +1,13 @@
 [package]
 name = "chess-render"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "A configurable, embeddable chess GUI with UCI support and move validation."
+description = "A configurable, embeddable chess GUI with UCI support, clocks, undo/redo, PGN export, animations, and move validation."
 license = "MIT"
 authors = ["Himansh Mewada <himanshmewada06@atomicmail.io>"]
 repository = "https://github.com/himanshm/chess-render"
 readme = "README.md"
-keywords = ["chess", "gui", "uci", "board", "render"]
+keywords = ["chess", "gui", "uci", "board", "macroquad"]
 categories = ["game-engines", "gui"]
 
 [dependencies]
@@ -17,7 +17,8 @@ egui-macroquad = "0.17.3"
 log = "0.4.33"
 macroquad = "0.4.15"
 thiserror = "2.0.18"
-# `uci` is optional — only compiled when the "uci" feature is enabled.
+
+# Optional UCI support
 uci = { version = "0.2.3", optional = true }
 
 [dev-dependencies]
@@ -26,3 +27,7 @@ env_logger = "0.11.10"
 [features]
 default = []
 uci = ["dep:uci"]
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
