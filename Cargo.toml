@@ -1,8 +1,8 @@
 [package]
 name = "chess-render"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
-description = "A configurable, embeddable chess GUI with UCI support, clocks, undo/redo, PGN export, animations, and move validation."
+description = "An embeddable chess GUI widget for Rust built with Macroquad. Provides a complete chess board with move validation, AI integration (UCI), clocks, undo/redo, PGN export, and customizable visuals—ready to drop into any Rust project."
 license = "MIT"
 authors = ["Himansh Mewada <himanshmewada06@atomicmail.io>"]
 repository = "https://github.com/himanshm/chess-render"
